@@ -1,46 +1,143 @@
 #include <Arduino.h>
 #include <PubSubClient.h>
-
 #include "ESPBASE.h"
+#include "dimmer.h"
+#include "hw_timer.h"
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 const byte mqttDebug = 1;
 //const int ESP_BUILTIN_LED = 1;
-#define RELAY1_PIN 12
-#define RELAY2_PIN 13
+//#define RELAY1_PIN 12
+//#define RELAY2_PIN 13
 #define STATUS_LED 16
-byte relay1state = 0;
-byte relay2state = 0;
+//byte relay1state = 0;
+//byte relay2state = 0;
+dimmer* Dimmer;
 String sChipID;
 long lastReconnectAttempt = 0;
+unsigned long lastschedulecheck = 0;
 int rbver = 0;
-String RelayTopic;
+String DimmerTopic;
 String StatusTopic;
+unsigned long reporttimemilli = 600000;
+unsigned long lastreporttime = 0;
+String ScheduleTopic;
+bool scheduleon;
+void zcDetectISR();
+void dimTimerISR();
+const byte outPin = 13;
+byte curBrightness = 0;
+byte zcState = 0; // 0 = ready; 1 = processing;
+volatile int zc = 0;
+volatile int zcount = 0;
+volatile long tmcount = 0;
 
 ESPBASE Esp;
+void sendStatus();
 
 void setup() {
   Serial.begin(115200);
   char cChipID[10];
   sprintf(cChipID,"%08X",ESP.getChipId());
   sChipID = String(cChipID);
-
+  Dimmer = new dimmer("driveway");
   Esp.initialize();
-  RelayTopic = String(DEVICE_TYPE) + "/" + config.DeviceName + "/command";
+  DimmerTopic = String(DEVICE_TYPE) + "/" + config.DeviceName + "/command";
   StatusTopic = String(DEVICE_TYPE) + "/" + config.DeviceName + "/status";
+  ScheduleTopic = String(DEVICE_TYPE) + "/" + config.DeviceName + "/schedule";
   Esp.setupMQTTClient();
   customWatchdog = millis();
+  pinMode(Dimmer->zcPin, INPUT_PULLUP);
+  pinMode(outPin, OUTPUT);
+  hw_timer_init(NMI_SOURCE, 0);
+  hw_timer_set_func(dimTimerISR);
+  attachInterrupt(Dimmer->zcPin, zcDetectISR, RISING);
 
-  pinMode(RELAY1_PIN,OUTPUT);
-  pinMode(RELAY2_PIN,OUTPUT);
- 
+  scheduleon = false;
+
   Serial.println("Done with setup");
   Serial.println(config.ssid);
 }
 
-void loop() {
+void setSchedule()
+{
+  if(suntime.valid && UnixTimestamp > 100000)
+  {
+    long tmnow = (DateTime.hour*60+DateTime.minute) * 60;
+    Serial.println("now " + String(DateTime.hour) + ":" + String(DateTime.minute));
+    long nexton = 86401;
+    int noshed = -1;
+  //  Serial.println(String(DateTime.hour) + ":"+String(DateTime.minute));
+    for(int i=0;i<10;i++)
+    {
+      if(i < 2)
+      {
+        if(config.DSchedule[i].onatsunset)
+        {
+          config.DSchedule[i].onHour = suntime.setHour;
+          config.DSchedule[i].onMin = suntime.setMin;
+        }  
+        if(config.DSchedule[i].offatsunrise)
+        {
+          config.DSchedule[i].offHour = suntime.riseHour;
+          config.DSchedule[i].offMin = suntime.riseMin;
+        }
+      }  
+      if(config.DSchedule[i].wdays[DateTime.wday-1])
+      {
+        if(Dimmer->getonTime() == 0 && Dimmer->getoffTime() == 0)
+        {
+          long tmschedon = (config.DSchedule[i].onHour*60+config.DSchedule[i].onMin) * 60;
+          if(tmschedon > tmnow)
+          {
+            tmschedon = tmschedon - tmnow;
+            if(tmschedon < nexton)
+            {
+              Serial.println("Dimmer schedule " + String(config.DSchedule[i].onHour) + ":" + String(config.DSchedule[i].onMin) + " " + String(tmschedon));
+              nexton = tmschedon;
+              noshed = i;
+            }
+          }
+        } 
+      }
+    }
+    if(nexton < 86401)
+    {
+      Dimmer->setonTime(nexton);
+      long offseconds = (config.DSchedule[noshed].offHour*60+config.DSchedule[noshed].offMin) * 60;
+      Serial.println(String(config.DSchedule[noshed].offHour) + ":" + String(config.DSchedule[noshed].offMin) + " " + String(offseconds));
+      offseconds = offseconds - tmnow;
+      Serial.println(String(offseconds));
+      if(offseconds < nexton)
+        offseconds = offseconds + 86400;  // add 24 hours
+      Serial.println(offseconds);
+      Dimmer->setoffTime(offseconds);
+      Serial.println("Set Dimmer schedule to on " + String(Dimmer->getonTime()) + " off " + String(Dimmer->getoffTime()));
+    }
+  }
+//  return false;
+}
+
+void loop() 
+{
   Esp.loop();
+  if(millis() > lastreporttime + reporttimemilli)
+  {
+    if(config.ReportTime)
+    {
+      Esp.mqttSend(String(DEVICE_TYPE) + "/" + config.DeviceName + "/time",String(DateTime.hour) + ":" + String(DateTime.minute) + ":" + String(DateTime.second),"");
+      String sched = "Dimmer  on " + String(Dimmer->getonTime()) + " off " + String(Dimmer->getoffTime());
+      Serial.println(sched);
+      Esp.mqttSend(String(DEVICE_TYPE) + "/" + config.DeviceName + "/schedule",sched," now " + String((DateTime.hour*60+DateTime.minute)*60));
+    }
+    lastreporttime = millis();
+  }
+  if(millis() > lastschedulecheck + 60000)
+  {
+    lastschedulecheck = millis();
+    setSchedule();
+  }
 }
 
 String getSignalString()
@@ -60,13 +157,9 @@ String getSignalString()
 
 void sendStatus()
 {
-  String message = config.Relay1Name + ",1,";
-  if(relay1state == 1)
-    message = message + "on";
-  else
-    message = message + "off";
-  message = message + ":" + config.Relay2Name + ",2,";
-  if(relay2state == 1)
+  String message = "";
+  message = message + Dimmer->getName() + ",";
+  if(Dimmer->getState() == 1)
     message = message + "on";
   else
     message = message + "off";
@@ -85,74 +178,33 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   {
     sendStatus();
   }
-  if (s_topic == RelayTopic || s_topic == "AllLights") {
+  if (s_topic == DimmerTopic || s_topic == "AllLights" || s_topic == "computer/timer/event") 
+  {
     if(s_payload == "signal")
     {
       Esp.mqttSend(StatusTopic,sChipID," WiFi: " + getSignalString());
     }
     if(s_payload == "TOGGLE")
     {
-      if(relay1state == 1)
-      {
-        s_payload = "OFF";
-      }
-      else
-      {
-        s_payload = "ON";
-      }
+      Dimmer->toggle();
     }
-    if(s_payload == "TOGGLE_1")
+    if(s_payload == "ON")
     {
-      if(relay1state == 1)
-      {
-        s_payload = "OFF_1";
-      }
-      else
-      {
-        s_payload = "ON_1";
-      }
+      Dimmer->setState(1);
     }
-    if(s_payload == "TOGGLE_2")
+    if(s_payload == "OFF")
     {
-      if(relay2state == 1)
-      {
-        s_payload = "OFF_2";
-      }
-      else
-      {
-        s_payload = "ON_2";
-      }
+      Dimmer->setState(0);
     }
-    if(s_payload == "ON_1" || s_payload == "ON")
-    {
-      relay1state = 1;
-      digitalWrite(RELAY1_PIN,HIGH);
-    }
-    if(s_payload == "OFF_1" || s_payload == "OFF")
-    {
-      relay1state = 0;
-      digitalWrite(RELAY1_PIN,LOW);
-    }
-    if(s_payload == "ON_2" || s_payload == "ON")
-    {
-      relay2state = 1;
-      digitalWrite(RELAY2_PIN,HIGH);
-    }
-    if(s_payload == "OFF_2" || s_payload == "OFF")
-    {
-      relay2state = 0;
-      digitalWrite(RELAY2_PIN,LOW);
-    }
-    sendStatus();
   }
 }
 
 void mqttSubscribe()
 {
     if (Esp.mqttClient->connected()) {
-      if (Esp.mqttClient->subscribe(RelayTopic.c_str())) {
-        Serial.println("Subscribed to " + RelayTopic);
-        Esp.mqttSend(StatusTopic,"","Subscribed to " + RelayTopic);
+      if (Esp.mqttClient->subscribe(DimmerTopic.c_str())) {
+        Serial.println("Subscribed to " + DimmerTopic);
+        Esp.mqttSend(StatusTopic,"","Subscribed to " + DimmerTopic);
         Esp.mqttSend(StatusTopic,verstr,","+Esp.MyIP()+" start");
       }
       if (Esp.mqttClient->subscribe("SendStat"))
@@ -163,7 +215,93 @@ void mqttSubscribe()
       {
         Serial.println("Subscribed to AllLights");
       }
+      if (Esp.mqttClient->subscribe("computer/timer/event"))
+      {
+        Serial.println("Subscribed to computer/timer/event");
+      }
+      char buff[100];
+      ScheduleTopic.toCharArray(buff,100);
+      if (Esp.mqttClient->subscribe((const char *)buff))
+      {
+        Serial.println("Subscribed to " + ScheduleTopic);
+      }
     }
 }
 
+void mainTick()
+{
+  Dimmer->tick();
+}
 
+
+void dimTimerISR() 
+{
+//    if(!allowinterrupts)
+//      return;
+    tmcount++;
+    if (Dimmer->fade == 1) 
+    {
+      if (curBrightness > Dimmer->tarBrightness || (Dimmer->state == 0 && curBrightness > 0)) 
+      {
+        Dimmer->dbrightness = Dimmer->dbrightness-Dimmer->dfaderate;
+        curBrightness = (int) Dimmer->dbrightness;
+      }
+      else if (curBrightness < Dimmer->tarBrightness && Dimmer->state == 1 && curBrightness < 255) 
+      {
+        Dimmer->dbrightness = Dimmer->dbrightness+Dimmer->dfaderate;
+        curBrightness = (int) Dimmer->dbrightness;
+      }
+    }
+    else 
+    {
+      if (Dimmer->state == 1) 
+      {
+        curBrightness = Dimmer->tarBrightness;
+        Dimmer->dbrightness = curBrightness;
+      }
+      else 
+      {
+        curBrightness = 0;
+        Dimmer->dbrightness = 0.0;
+      }
+    }
+    
+    if (curBrightness == 0) 
+    {
+      Dimmer->state = 0;
+      digitalWrite(outPin, 0);
+    }
+    else if (curBrightness == 255) 
+    {
+      Dimmer->state = 1;
+      digitalWrite(outPin, 1);
+    }
+    else 
+    {
+      digitalWrite(outPin, 1);
+    }
+    
+    zcState = 0;
+}
+
+void zcDetectISR() 
+{
+//  if(!allowinterrupts)
+//    return;
+//  cycletime = millis() - oldmillis;
+//  oldmillis = millis();
+  zc++;
+  zcount++;
+  if (zcState == 0) 
+  {
+    zcState = 1;
+  
+    if (curBrightness < 255 && curBrightness > 0) 
+    {
+      digitalWrite(outPin, 0);
+      
+      int dimDelay = 30 * (255 - curBrightness) + 400;
+      hw_timer_arm(dimDelay);
+    }
+  }
+}
